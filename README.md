@@ -1,77 +1,112 @@
-# ocr-translate-agent
+# Agentic OCR → Translate Pipeline, Observed with SigNoz
 
-An agentic OCR -> translate pipeline (Gemini) fully instrumented with
-OpenTelemetry and observed via SigNoz.
+Built for the WeMakeDevs × SigNoz **"Agents of SigNoz"** hackathon — Track 1: AI & Agent Observability.
 
-**The agentic part:** after the first OCR pass, the pipeline checks its own
-confidence score. If it's below `CONFIDENCE_THRESHOLD`, it *decides* to retry
-with a stricter prompt before moving on to translation. Both the decision and
-both OCR attempts show up as distinct spans in the trace, so you can see the
-agent branching in the SigNoz UI - not just a fixed call chain.
+An OCR → translate pipeline that makes one real agentic decision (whether to retry a low-confidence OCR read before translating), fully instrumented with OpenTelemetry and observed end-to-end in a self-hosted SigNoz instance — traces, metrics, dashboards, alerts, and a small "SRE Sidekick" that answers plain-English questions about the pipeline by querying SigNoz directly.
 
-## 1. Start SigNoz (self-hosted, local)
+**AI-assistance disclosure:** this project was built with Claude (Anthropic) as a coding/debugging assistant throughout — architecture decisions, debugging Docker/SigNoz/Groq issues, and code generation were done collaboratively with Claude. Per the hackathon rules, this is disclosed here plainly.
 
-Do this in a separate terminal/folder, NOT inside this project:
+---
 
-```bash
-git clone -b main https://github.com/SigNoz/signoz.git
-cd signoz/deploy/docker
-docker compose up -d
+## What it does
+
+1. A client sends an image (receipt, invoice, document) to `POST /ocr-translate`.
+2. The pipeline calls a vision-capable LLM (Groq / Qwen 3.6 27B) to extract text and self-report a confidence score.
+3. **The agentic decision:** if confidence is below a configurable threshold, the pipeline decides on its own to retry the OCR with a stricter prompt before moving on — it doesn't just always retry, and it doesn't skip straight to translation either.
+4. The extracted (possibly retried) text is translated to the requested target language, via the same LLM.
+5. Every step — both OCR attempts, the retry decision itself, and the translation — is captured as its own OpenTelemetry span, with token usage and duration recorded as custom metrics.
+
+A second endpoint, `POST /sidekick`, lets you ask questions like *"What's the average latency?"* or *"Any errors in the last hour?"* — it maps the question to a SigNoz query, fetches the real data, and has the LLM summarize it in one honest sentence.
+
+## Architecture
+
+```
+        image
+          │
+          ▼
+  ┌───────────────┐        ┌─────────────────────┐
+  │  Express API  │──────▶ │ Groq (Qwen 3.6 27B)  │
+  │ (Node.js)     │        │ OCR + translate calls │
+  └───────┬───────┘        └─────────────────────┘
+          │  OpenTelemetry SDK
+          │  (traces + metrics, OTLP/HTTP)
+          ▼
+  ┌───────────────────────────────┐
+  │  Self-hosted SigNoz (Docker,  │
+  │  installed via Foundry)       │
+  │  - Traces  - Metrics          │
+  │  - Dashboards  - Alerts       │
+  └───────────────┬───────────────┘
+                  │  queried by
+                  ▼
+        POST /sidekick (same backend)
+        → SigNoz Query API (/api/v5/query_range)
+        → summarized by Groq into plain English
 ```
 
-Give it a minute to start, then open http://localhost:3301 to confirm the
-SigNoz UI loads. The OTel Collector will be listening on localhost:4318
-(HTTP) - that's what this backend sends to.
+The backend is a single Node/Express service. There's no separate service for the sidekick — it reuses the same instrumented backend and queries SigNoz's own API, which means the sidekick's own requests are *also* traced (`sidekick.ask` span), so the observability layer observes itself asking questions about itself.
 
-If your local ports differ, update OTLP_ENDPOINT in your `.env`.
+## Tech stack
 
-## 2. Set up this backend
+- **Node.js / Express** — API server
+- **OpenTelemetry SDK for Node** (`@opentelemetry/sdk-node`, auto-instrumentations) — traces + custom metrics, exported over OTLP/HTTP
+- **SigNoz**, self-hosted via **Foundry** (Docker) — the observability backend
+- **Groq API** (Qwen 3.6 27B, vision-capable) — OCR + translation + sidekick summarization, via an OpenAI-compatible client
+- **SigNoz Query API v5** (`/api/v5/query_range`) — used directly by the sidekick endpoint to fetch real trace/metric data
+
+## What's instrumented in SigNoz
+
+- **Traces**: full span tree per request — `pipeline.ocr_translate` (root) → `ocr.attempt.initial` → optionally `ocr.attempt.strict` (the retry) → `translate.attempt`. The retry decision itself is recorded as a span event (`pipeline.decision`) with the confidence value and threshold, so the *reasoning*, not just the outcome, is visible in the trace.
+- **Metrics**: `gemini.tokens.total` (tagged by stage: ocr/translate), `pipeline.ocr.retries` (tagged by reason), `pipeline.duration.ms` (histogram).
+- **Dashboard**: 4 panels — token usage by pipeline stage, pipeline latency, agentic retry triggers, request success/error rate.
+- **Alert**: threshold alert on pipeline latency (fires above 3000ms), configured with a webhook notification channel.
+- **SRE Sidekick**: a natural-language interface over the SigNoz Query API — currently reliably answers latency and error-rate questions; token-cost and retry-rate queries hit a metrics-aggregation edge case I didn't have time to fully resolve (see Known Limitations).
+
+## Reproducing the SigNoz deployment
+
+This repo includes `signoz-deploy/casting.yaml` and `signoz-deploy/casting.yaml.lock`, generated by Foundry. To reproduce the exact deployment:
 
 ```bash
-cd signoz-hackathon-backend
+curl -fsSL https://signoz.io/foundry.sh | bash
+cd signoz-deploy
+foundryctl cast -f casting.yaml
+```
+
+## Running the backend
+
+```bash
 npm install
-cp .env.example .env
-# edit .env and paste in your GEMINI_API_KEY
+cp env.example .env   # fill in GROQ_API_KEY, SIGNOZ_URL, SIGNOZ_API_KEY
 npm start
 ```
 
-You should see:
-```
-[otel] instrumentation started, exporting to http://localhost:4318
-ocr-translate-agent listening on :3000
-```
-
-## 3. Send a test request
-
+Then:
 ```bash
 curl -X POST http://localhost:3000/ocr-translate \
-  -F "image=@/path/to/some/image.jpg" \
+  -F "image=@/path/to/image.jpg" \
   -F "targetLang=Spanish"
+
+curl -X POST http://localhost:3000/sidekick \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the average latency?"}'
 ```
 
-Then go to the SigNoz UI -> Traces, and look for the `ocr-translate-agent`
-service. You should see a `pipeline.ocr_translate` root span containing
-`ocr.attempt.initial`, optionally `ocr.attempt.strict` if a retry fired, and
-`translate.attempt`.
+## An honest finding: self-reported confidence isn't a reliable trust signal
 
-## 4. To force a retry (for a good demo trace)
+This is the most important thing this project surfaced, and it's worth stating plainly rather than glossing over.
 
-Send a blurry/low-quality image, or a very cluttered one - Gemini's
-self-reported confidence will often drop below the 0.7 threshold and you'll
-see the retry span appear.
+I ran the same known-ground-truth invoice image through the pipeline multiple times, in clean and deliberately-degraded (blurred) form. Across runs, the model's self-reported OCR confidence stayed consistently high — **0.95 to 0.98** — regardless of whether the extracted content was actually correct. On several runs, specific fields were silently wrong (a name changed from "Adaeze Okafor" to "Adeane Walker" in one run and "Adamo Okafor" in another; dollar amounts and even the year were altered) while the model still reported 0.95+ confidence, and in one case recalculated tax/totals *correctly against its own wrong line items* — meaning the arithmetic checked out even though the source numbers didn't, which is a genuinely dangerous failure mode since it wouldn't be caught by a human sanity-checking the math.
 
-## What's instrumented
+The confidence-triggered retry mechanism works exactly as designed *mechanically* — it does branch correctly when confidence drops below threshold, and that branch is visible in the trace. But the underlying signal it depends on (the model's own confidence score) did not reliably correlate with actual correctness in testing. This is a known class of LLM failure (confident confabulation), not a bug in this pipeline specifically — but it's a real, reproducible finding from this project, and it's exactly the kind of thing observability should surface: a human watching traces could notice two "high confidence" attempts producing contradictory content, even though no automated check here currently catches it.
 
-- **Traces**: full pipeline span tree, including the branch decision as a
-  span event on the root span (`pipeline.decision`)
-- **Metrics**: `gemini.tokens.total` (tagged by stage: ocr/translate),
-  `pipeline.ocr.retries`, `pipeline.duration.ms`
-- **Logs**: errors are logged to stdout and recorded as exceptions on their
-  span (`span.recordException`), so they correlate to the trace in SigNoz
+## Known limitations
 
-## Next steps (not yet built)
+- The SRE Sidekick reliably answers latency and error-rate questions. Token-cost and retry-rate questions currently return "no data" more often than they should — likely a metrics-aggregation query shape issue against SigNoz's v5 Query API that I ran out of time to fully debug.
+- OCR/translation quality depends on Groq's currently-available vision model (`qwen/qwen3.6-27b`), which is in earlier maturity than something like GPT-4V or Gemini's vision models — see the confidence finding above.
+- This is a single-service demo, not a production system — no auth on the API, no rate limiting, no persistence layer.
 
-- SigNoz dashboard: latency per stage, token cost over time, retry rate
-- One alert (e.g. p95 pipeline duration or error rate)
-- Flutter "SRE Sidekick" that queries SigNoz to answer questions about the
-  pipeline in natural language
+## What I'd build next
+
+- Fix the sidekick's token/retry query aggregations.
+- Add a second, independent verification signal for OCR correctness (e.g., cross-checking arithmetic on extracted numeric fields) rather than trusting self-reported confidence alone — directly motivated by the finding above.
+- A proper Flutter front-end for the sidekick (scoped and started, but cut for time — the backend endpoint is real and working for 2 of 4 question types).
