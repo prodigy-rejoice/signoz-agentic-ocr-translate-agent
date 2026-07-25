@@ -168,7 +168,185 @@ async function runPipeline(imageBase64, mimeType, targetLang) {
   });
 }
 
+// --- SRE Sidekick: answers questions about the pipeline by querying SigNoz ---
+
+const SIGNOZ_URL = process.env.SIGNOZ_URL || 'http://localhost:8080';
+const SIGNOZ_API_KEY = process.env.SIGNOZ_API_KEY;
+
+// Picks a query template based on keywords in the question. Not a general NL
+// interface - a small set of reliable patterns is more honest for a hackathon
+// demo than pretending to understand arbitrary questions.
+function pickTemplate(question) {
+  const q = question.toLowerCase();
+  if (/(error|fail|broke|broken)/.test(q)) return 'errors';
+  if (/(retry|retries|retried)/.test(q)) return 'retries';
+  if (/(token|cost|expensive)/.test(q)) return 'tokens';
+  if (/(latency|slow|duration|speed|fast)/.test(q)) return 'latency';
+  return 'requests';
+}
+
+function buildQuery(template, sinceMs, nowMs) {
+  const base = { start: sinceMs, end: nowMs, requestType: 'time_series' };
+  switch (template) {
+    case 'errors':
+      return {
+        ...base,
+        compositeQuery: {
+          queries: [{
+            type: 'builder_query',
+            spec: {
+              name: 'A',
+              signal: 'traces',
+              aggregations: [{ expression: 'count()' }],
+              filter: { expression: "service.name = 'ocr-translate-agent' AND name = 'pipeline.ocr_translate' AND status_code = 'STATUS_CODE_ERROR'" },
+              stepInterval: 60,
+              disabled: false,
+            },
+          }],
+        },
+      };
+    case 'retries':
+      return {
+        ...base,
+        compositeQuery: {
+          queries: [{
+            type: 'builder_query',
+            spec: {
+              name: 'A',
+              signal: 'metrics',
+              aggregations: [{ metricName: 'pipeline.ocr.retries', timeAggregation: 'increase', spaceAggregation: 'sum' }],
+              stepInterval: 60,
+              disabled: false,
+            },
+          }],
+        },
+      };
+    case 'tokens':
+      return {
+        ...base,
+        compositeQuery: {
+          queries: [{
+            type: 'builder_query',
+            spec: {
+              name: 'A',
+              signal: 'metrics',
+              aggregations: [{ metricName: 'gemini.tokens.total', timeAggregation: 'increase', spaceAggregation: 'sum' }],
+              groupBy: [{ name: 'stage' }],
+              stepInterval: 60,
+              disabled: false,
+            },
+          }],
+        },
+      };
+    case 'latency':
+      return {
+        ...base,
+        compositeQuery: {
+          queries: [{
+            type: 'builder_query',
+            spec: {
+              name: 'A',
+              signal: 'metrics',
+              aggregations: [{ metricName: 'pipeline.duration.ms.max', timeAggregation: 'avg', spaceAggregation: 'avg' }],
+              stepInterval: 60,
+              disabled: false,
+            },
+          }],
+        },
+      };
+    default: // requests
+      return {
+        ...base,
+        compositeQuery: {
+          queries: [{
+            type: 'builder_query',
+            spec: {
+              name: 'A',
+              signal: 'traces',
+              aggregations: [{ expression: 'count()' }],
+              filter: { expression: "service.name = 'ocr-translate-agent' AND name = 'pipeline.ocr_translate'" },
+              stepInterval: 60,
+              disabled: false,
+            },
+          }],
+        },
+      };
+  }
+}
+
+async function querySignoz(body) {
+  const resp = await fetch(`${SIGNOZ_URL}/api/v5/query_range`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'SIGNOZ-API-KEY': SIGNOZ_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`SigNoz query failed (${resp.status}): ${text}`);
+  }
+  return resp.json();
+}
+
+app.post('/sidekick', express.json(), async (req, res) => {
+  return tracer.startActiveSpan('sidekick.ask', async (span) => {
+    const question = (req.body && req.body.question || '').trim();
+    if (!question) {
+      span.end();
+      return res.status(400).json({ error: 'body must include "question"' });
+    }
+    span.setAttribute('sidekick.question', question);
+
+    try {
+      const template = pickTemplate(question);
+      span.setAttribute('sidekick.template', template);
+
+      const nowMs = Date.now();
+      const sinceMs = nowMs - 60 * 60 * 1000; // last 1 hour
+      const query = buildQuery(template, sinceMs, nowMs);
+
+      const raw = await querySignoz(query);
+
+      // Summarize the raw SigNoz JSON into a plain-English sentence via Groq.
+      const completion = await client.chat.completions.create({
+        model: MODEL_NAME,
+        reasoning_effort: 'none',
+        messages: [{
+          role: 'user',
+          content:
+            `You are an SRE assistant. A user asked: "${question}"\n` +
+            `Here is the raw observability query result (JSON) for the last hour:\n${JSON.stringify(raw)}\n\n` +
+            `Answer the user's question in ONE short, plain-English sentence based only on this data. ` +
+            `If the data is empty or you can't tell, say so honestly rather than guessing a number.`,
+        }],
+      });
+      const rawAnswer = completion.choices[0].message.content;
+      const answer = rawAnswer.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+
+      span.setStatus({ code: SpanStatusCode.OK });
+      res.json({ question, template, answer });
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      console.error('[sidekick error]', err.message);
+      res.status(500).json({ error: 'sidekick failed', detail: err.message });
+    } finally {
+      span.end();
+    }
+  });
+});
+
 // --- HTTP layer --------------------------------------------------------------
+
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
