@@ -4,7 +4,7 @@ Built for the WeMakeDevs × SigNoz **"Agents of SigNoz"** hackathon — Track 1:
 
 An OCR → translate pipeline that makes one real agentic decision (whether to retry a low-confidence OCR read before translating), fully instrumented with OpenTelemetry and observed end-to-end in a self-hosted SigNoz instance — traces, metrics, dashboards, alerts, and a small "SRE Sidekick" that answers plain-English questions about the pipeline by querying SigNoz directly.
 
-**AI-assistance disclosure:** this project was built with Claude (Anthropic) as a coding/debugging assistant throughout — architecture decisions, debugging Docker/SigNoz/Groq issues, and code generation were done collaboratively with Claude. Per the hackathon rules, this is disclosed here plainly.
+**AI-assistance disclosure:** this project was built with Claude (Anthropic) as a coding and debugging assistant. Per the hackathon rules, this is disclosed here .
 
 ---
 
